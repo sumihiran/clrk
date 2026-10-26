@@ -6,15 +6,15 @@ import (
 	"strings"
 )
 
-// Public-GAR repo paths where every clrk main commit lands. The
-// .github/workflows/clrk.yml workflow in apoxy-cloud (triggered by a
-// repository_dispatch from this repo) builds the bazel OCI tarballs
-// and pushes them with the first 8 hex chars of the clrk SHA as the
-// tag. ImageTag() below mirrors that derivation so a `clrk` binary
-// built from a given SHA defaults to the matching pushed image.
+// Public GHCR repo paths where clrk builds land. The build workflow in
+// github.com/sumihiran/clrk-cloud builds the images and pushes them with
+// the first 8 hex chars of the clrk SHA as the tag (plus the release
+// version when the commit is tagged). ImageTag() below mirrors that
+// derivation so a `clrk` binary built from a given SHA defaults to the
+// matching pushed image.
 const (
-	ClrkControllerManagerImagePath = "us-west1-docker.pkg.dev/apoxy-dev/public/clrk-controller-manager"
-	ClrkWorkerImagePath            = "us-west1-docker.pkg.dev/apoxy-dev/public/clrk-worker"
+	ClrkControllerManagerImagePath = "ghcr.io/sumihiran/clrk-controller-manager"
+	ClrkWorkerImagePath            = "ghcr.io/sumihiran/clrk-worker"
 
 	// LocalRegistryControllerManagerImage is the in-network ref clrk
 	// dev's controller-manager container uses when launched with
@@ -51,10 +51,8 @@ func LocalRegistryHostRef(component string, port int) string {
 //     `v0.0.0-<timestamp>-<sha-12>`. We pull the last 12 hex chars
 //     and truncate to 8.
 //
-// Falls back to "latest" if neither is reachable — the publish
-// workflow doesn't push a `:latest` tag, so that fallback surfaces a
-// clear `manifest unknown` from `docker pull` instead of silently
-// running stale code.
+// Falls back to "latest" if neither is reachable, which the publish
+// workflow points at the newest non-prerelease build.
 func ImageTag() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {

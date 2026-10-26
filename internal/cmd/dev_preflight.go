@@ -87,7 +87,7 @@ func checkLinuxKernel(ctx context.Context, _ *devOpts) error {
 // "unauthorized" before bringUp tries the same pull as part of
 // `docker run`. Catches the most common case after my last commit:
 // the published image tag for this clrk SHA hasn't landed because
-// the apoxy-cloud publish workflow failed or hasn't run yet.
+// the clrk-cloud publish workflow failed or hasn't run yet.
 //
 // `--registry-image=<component>=<ref>` sets the image to a
 // clrk-registry:5000/... ref that's unreachable from the host
@@ -110,7 +110,7 @@ func checkImagePullable(ctx context.Context, o *devOpts) error {
 	hint := fmt.Sprintf("either pin to a published tag with --controller-image / --worker-image, "+
 		"or push a locally-built image to the dev registry and pass "+
 		"`--registry-image=<component>=clrk-registry:5000/...`. "+
-		"Image tags follow the clrk SHA; check the apoxy-cloud clrk.yml workflow run for SHA %s.",
+		"Image tags follow the clrk SHA; check the sumihiran/clrk-cloud build workflow run for SHA %s.",
 		drivers.ImageTag())
 	return errors.New(strings.Join(errs, "; ") + " — " + hint)
 }
