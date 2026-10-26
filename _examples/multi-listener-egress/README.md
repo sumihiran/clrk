@@ -63,12 +63,15 @@ If both shapes show up, the per-listener split is working end-to-end:
 the reconciler allocated two distinct ports, the egextension rewrote
 each chain per shape, and the worker dispatches per dial.
 
-## Caveat — TLS-passthrough is currently broken
+## TLS-passthrough
 
-This example uses TLS-Terminate (working) + plain TCP (working). A
-third shape — TLS-passthrough (`mode: Passthrough`) — is admission-
-accepted but doesn't function end-to-end yet because the chain reuses
-the HCM-side dynamic_forward_proxy cluster, which TLS-wraps upstream
-connections and double-wraps an already-TLS agent stream. Tracked in
-`apoxy-cloud//docs/clrk-improvements.md` (entry: "TLS-passthrough
-chain TLS-wraps upstream").
+A third shape, TLS-passthrough (`protocol: TLS`, `tls.mode:
+Passthrough`), forwards the agent's TLS bytes untouched: the chain reads
+the SNI off the ClientHello and dials it with the non-TLS
+`clrk-egress-dfp-plain` cluster, so the agent's own TLS session reaches
+the upstream end to end. The upstream is always dialed on port 443
+(sni_dynamic_forward_proxy has a fixed port), so give a passthrough
+listener `port: 443` and keep non-443 TLS destinations on a
+TLS-Terminate or TCP listener. Records are L4 (`egress.tcp`, upstream
+byte count); there are no headers or bodies to capture and no
+credentials to inject.

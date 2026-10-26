@@ -45,8 +45,8 @@ func RegisterNetworkServer(s *grpc.Server, server *Server) {
 // Process handles one network ext_proc stream. With ProcessRead =
 // STREAMED, ProcessWrite = SKIP the filter sends ReadData chunks for
 // every agent → server packet plus a final ReadData{end_of_stream:true}
-// when the connection closes. We respond UNMODIFIED + CONTINUE on
-// every chunk so Envoy forwards the original bytes unchanged.
+// when the connection closes. Each chunk is answered by l4Response,
+// which hands the bytes back so Envoy forwards them unchanged.
 func (n *NetworkServer) Process(stream netextprocsvcv3.NetworkExternalProcessor_ProcessServer) error {
 	ctx := stream.Context()
 	logger := ctrllog.FromContext(ctx).WithName("extproc-l4")
@@ -90,17 +90,42 @@ func (n *NetworkServer) Process(stream netextprocsvcv3.NetworkExternalProcessor_
 		if d := req.GetReadData(); d != nil {
 			rec.BytesUpstream += int64(len(d.Data))
 		}
-		// WriteData branch is unreachable under ProcessWrite = SKIP.
 
-		if err := stream.Send(&netextprocsvcv3.ProcessingResponse{
-			DataProcessingStatus: netextprocsvcv3.ProcessingResponse_UNMODIFIED,
-			ConnectionStatus:     netextprocsvcv3.ProcessingResponse_CONTINUE,
-		}); err != nil {
+		if err := stream.Send(l4Response(req)); err != nil {
 			rec.EndAt = time.Now()
 			sink.EmitL4(rec)
 			return err
 		}
 	}
+}
+
+// l4Response answers one ProcessingRequest by returning its bytes
+// unchanged, in the direction they arrived. The network_ext_proc filter
+// drains the connection buffer when it sends a chunk and forwards only
+// what the response carries: a response with no read_data/write_data
+// counts as empty_response_received and the client's bytes are dropped.
+// The connection then stalls until the message timeout closes the side
+// stream (failure_mode_allow), and the handshake bytes never reach the
+// upstream. Echoing end_of_stream propagates a half-close.
+//
+// WriteData is unreachable under ProcessWrite = SKIP; it is answered the
+// same way so a config change that starts sending it can't swallow the
+// server → agent direction either.
+func l4Response(req *netextprocsvcv3.ProcessingRequest) *netextprocsvcv3.ProcessingResponse {
+	resp := &netextprocsvcv3.ProcessingResponse{
+		DataProcessingStatus: netextprocsvcv3.ProcessingResponse_UNMODIFIED,
+		ConnectionStatus:     netextprocsvcv3.ProcessingResponse_CONTINUE,
+	}
+	echo := func(d *netextprocsvcv3.Data) *netextprocsvcv3.Data {
+		return &netextprocsvcv3.Data{Data: d.GetData(), EndOfStream: d.GetEndOfStream()}
+	}
+	switch {
+	case req.GetReadData() != nil:
+		resp.ReadData = echo(req.GetReadData())
+	case req.GetWriteData() != nil:
+		resp.WriteData = echo(req.GetWriteData())
+	}
+	return resp
 }
 
 // applyClrkMetadataL4 reads the same clrk.apoxy.dev namespace fields
