@@ -699,6 +699,12 @@ func main() {
 			grpc.StreamInterceptor(egidentity.PeerCertStreamServerInterceptor()),
 		}
 	}
+	// ext_proc receives a buffered body (a captured response, a buffered
+	// request) as one message. Size the ceiling to the largest listener
+	// buffer the egextension programs, plus framing headroom, instead of
+	// gRPC's 4 MiB default, which would fail such a body with a 500 well
+	// below the configured buffer limit.
+	grpcOpts = append(grpcOpts, grpc.MaxRecvMsgSize(clrkv1alpha1.MaxCapturedBodyBufferBytes+1<<20))
 	grpcSrv := grpc.NewServer(grpcOpts...)
 	envoytlsv3.RegisterCertificateProviderServiceServer(grpcSrv, certprovider.New(cm.GetClient()))
 	extprocSrv := extproc.New(cm.GetClient(), extproc.WithInvocationContext(invocations))

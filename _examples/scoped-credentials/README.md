@@ -66,3 +66,19 @@ headers, and only fills in headers nothing narrower sets. Adding an
 would therefore inject it only into requests that neither route above
 matches, while a gateway policy for a different header still applies
 everywhere.
+
+## Large responses
+
+Response bodies whose content type is outside the gateway's capture
+list (`spec.otlp.captureBody.includeContentTypes`, by default JSON,
+NDJSON and SSE) stream through without being buffered, so package
+downloads, archives and image layers of any size can be fetched through
+the gateway. Their records carry `clrk.resp.body_skipped=true` and no
+body or byte count.
+
+Captured, non-streamed responses are still buffered whole before they
+are released. Over HTTP/1.1 they can be at most the larger of
+`captureBody.maxBytes` and 4 MiB (capped at 64 MiB); over HTTP/2 at most
+the larger of that and 16 MiB. A larger captured response fails with
+HTTP 500. No `ClientTrafficPolicy` is needed for these defaults; larger
+values in one still win.

@@ -247,6 +247,15 @@ type EgressDNSSpec struct {
 type BodyCaptureSpec struct {
 	// MaxBytes caps the captured body size per direction. Bodies larger
 	// than this are truncated; the log record carries a truncated marker.
+	//
+	// It also sizes the proxy's buffers on HTTP listeners: a non-streamed
+	// response whose content type is captured is held whole before it is
+	// released, so it can be at most the larger of MaxBytes and 4 MiB
+	// (capped at 64 MiB; see EffectiveCapturedBodyBufferBytes) over
+	// HTTP/1.1, and at most the larger of that and 16 MiB (the downstream
+	// HTTP/2 stream window) over HTTP/2. A larger captured response fails
+	// with HTTP 500. Larger ClientTrafficPolicy connection.bufferLimit or
+	// http2 window values still win.
 	// +kubebuilder:default=65536
 	// +optional
 	MaxBytes *int32 `json:"maxBytes,omitempty"`
@@ -254,8 +263,44 @@ type BodyCaptureSpec struct {
 	// IncludeContentTypes limits body capture to these Content-Type
 	// prefixes. Empty means the default set (application/json,
 	// application/x-ndjson, text/event-stream).
+	//
+	// A response whose content type is outside this set (package
+	// downloads, archives, image layers) streams through without being
+	// buffered or observed: its record carries clrk.resp.body_skipped and
+	// no response body or byte count. Streamed responses
+	// (text/event-stream, x-ndjson, or a request that asked for a
+	// stream), cross-schema translated responses, and responses to
+	// bodyless requests are not affected.
 	// +optional
 	IncludeContentTypes []string `json:"includeContentTypes,omitempty"`
+}
+
+const (
+	// DefaultCapturedBodyBufferBytes is the per-connection buffer limit
+	// CLRK sets on HTTP egress listeners when BodyCaptureSpec.MaxBytes is
+	// smaller. Envoy Gateway's default (32 KiB) fails a provider's JSON
+	// model list; 4 MiB holds typical captured API responses.
+	DefaultCapturedBodyBufferBytes = 4 << 20
+	// MaxCapturedBodyBufferBytes caps the per-connection buffer limit,
+	// and with it the largest captured response. The ext_proc gRPC server
+	// accepts messages of this size plus framing headroom.
+	MaxCapturedBodyBufferBytes = 64 << 20
+)
+
+// EffectiveCapturedBodyBufferBytes resolves the per-connection buffer
+// limit for the gateway's HTTP listeners: BodyCaptureSpec.MaxBytes when it
+// exceeds DefaultCapturedBodyBufferBytes, capped at
+// MaxCapturedBodyBufferBytes. Shared by the controller (which makes a
+// change retranslate the gateway) and the EG extension server (which sets
+// it on the listener).
+func (s *EgressGatewaySpec) EffectiveCapturedBodyBufferBytes() uint32 {
+	n := int64(DefaultCapturedBodyBufferBytes)
+	if s.OTLP != nil && s.OTLP.CaptureBody != nil && s.OTLP.CaptureBody.MaxBytes != nil {
+		if mb := int64(*s.OTLP.CaptureBody.MaxBytes); mb > n {
+			n = mb
+		}
+	}
+	return uint32(min(n, MaxCapturedBodyBufferBytes))
 }
 
 // OTLPLogsSinkSpec configures where the controller-manager re-exports

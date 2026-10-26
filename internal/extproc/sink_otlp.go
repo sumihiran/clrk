@@ -211,6 +211,9 @@ func (s *otlpSink) emitSpan(r Record, d derived) oteltrace.Span {
 	if r.RequestBodyRewritten {
 		attrs = append(attrs, attribute.Bool(otelemit.AttrBodyReqRewritten, true))
 	}
+	if r.ResponseBodySkipped {
+		attrs = append(attrs, attribute.Bool(otelemit.AttrRespBodySkipped, true))
+	}
 	attrs = appendGenAIAttrs(attrs, r)
 	attrs = appendAPRAttrs(attrs, r)
 	attrs = appendBackendAttrs(attrs, r)
@@ -279,6 +282,9 @@ func (s *otlpSink) emitLog(r Record, d derived, sc oteltrace.SpanContext) {
 	}
 	if r.RequestBodyRewritten {
 		attrs = append(attrs, otellog.Bool(otelemit.AttrBodyReqRewritten, true))
+	}
+	if r.ResponseBodySkipped {
+		attrs = append(attrs, otellog.Bool(otelemit.AttrRespBodySkipped, true))
 	}
 	if sc.HasTraceID() {
 		attrs = append(attrs,

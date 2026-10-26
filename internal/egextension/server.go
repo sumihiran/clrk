@@ -160,6 +160,17 @@ const (
 	defaultExtProcTimeout = 30 * time.Second
 )
 
+// Downstream HTTP/2 flow-control windows set on clrk HTTP listeners.
+// ext_proc picks the response body mode only when it answers the response
+// headers; until then Envoy holds whatever body the upstream already
+// sent. Envoy Gateway's 64 KiB default stream window lets a fast upstream
+// overrun that hold within one ext_proc round trip and fail the response
+// with a 500, even for a body that then streams through unbuffered.
+const (
+	downstreamH2StreamWindowBytes     = 16 << 20
+	downstreamH2ConnectionWindowBytes = 32 << 20
+)
+
 // Server implements envoyproxy/gateway extension.EnvoyGatewayExtensionServer.
 // Register with a gRPC server via pb.RegisterEnvoyGatewayExtensionServer.
 type Server struct {
@@ -331,6 +342,35 @@ func (s *Server) lookupFamilyFor(ctx context.Context, key egKey) clusterv3.Clust
 	return envoyDnsLookupFamily(eg.Spec.DNS.LookupFamily)
 }
 
+// capturedBodyBufferFor resolves the EG's listener buffer limit
+// (EffectiveCapturedBodyBufferBytes), falling back to the default when
+// the EG can't be fetched. The controller makes a non-default value
+// retranslate the gateway (BufferRevHeaderName), which is what re-runs
+// this hook after a captureBody.maxBytes edit.
+func (s *Server) capturedBodyBufferFor(ctx context.Context, key egKey) uint32 {
+	if s.Client == nil {
+		return clrkv1alpha1.DefaultCapturedBodyBufferBytes
+	}
+	var eg clrkv1alpha1.EgressGateway
+	nn := types.NamespacedName{Namespace: key.namespace, Name: key.name}
+	if err := s.Client.Get(ctx, nn, &eg); err != nil {
+		if !apierrors.IsNotFound(err) {
+			ctrllog.FromContext(ctx).WithName("egextension").V(1).Info(
+				"Failed to fetch EgressGateway for buffer limit; using default",
+				"eg", nn, "error", err.Error())
+		}
+		return clrkv1alpha1.DefaultCapturedBodyBufferBytes
+	}
+	return eg.Spec.EffectiveCapturedBodyBufferBytes()
+}
+
+// raiseUInt32 sets *field to floor unless it already holds a larger value.
+func raiseUInt32(field **wrapperspb.UInt32Value, floor uint32) {
+	if *field == nil || (*field).GetValue() < floor {
+		*field = wrapperspb.UInt32(floor)
+	}
+}
+
 // dnsCacheNameFor / dfpClusterNameFor / dfpPlainClusterNameFor derive the
 // per-EG xDS names used by the DFP HTTP filter, the SNI filter, and the
 // two DFP clusters. Per-EG names sidestep EG v1.4's missing
@@ -467,6 +507,13 @@ func (s *Server) applyHTTPShape(ctx context.Context, listener *listenerv3.Listen
 		allChains = append(allChains, defaultFC)
 	}
 
+	// Captured response bodies are buffered whole before ext_proc sees
+	// them; size the connection buffer for them instead of Envoy
+	// Gateway's 32 KiB default. Raise-only: an operator's larger
+	// ClientTrafficPolicy connection.bufferLimit stays in force.
+	bufferLimit := s.capturedBodyBufferFor(ctx, egKey)
+	raiseUInt32(&listener.PerConnectionBufferLimitBytes, bufferLimit)
+
 	for _, fc := range allChains {
 		if shape == clrkv1alpha1.EgressShapeHTTP {
 			// Plain HTTP: there's no TLS handshake to terminate.
@@ -474,7 +521,7 @@ func (s *Server) applyHTTPShape(ctx context.Context, listener *listenerv3.Listen
 		} else if err := s.injectHandshaker(fc, egKey); err != nil {
 			logger.Error(err, "Inject handshaker failed", "filterChain", fc.GetName())
 		}
-		if err := s.rewriteHCM(fc, egKey, dnsCacheCfg, llmCfg); err != nil {
+		if err := s.rewriteHCM(fc, egKey, dnsCacheCfg, llmCfg, bufferLimit); err != nil {
 			logger.Error(err, "Rewrite HCM failed", "filterChain", fc.GetName())
 		}
 	}
@@ -722,7 +769,7 @@ func (s *Server) injectHandshaker(fc *listenerv3.FilterChain, key egKey) error {
 // The ext_proc filter is rebuilt per call because it carries a per-EG
 // :authority value that identifies the calling EG to the
 // controller-manager.
-func (s *Server) rewriteHCM(fc *listenerv3.FilterChain, key egKey, dnsCacheCfg *dfpcommonv3.DnsCacheConfig, llmCfg *llmConfig) error {
+func (s *Server) rewriteHCM(fc *listenerv3.FilterChain, key egKey, dnsCacheCfg *dfpcommonv3.DnsCacheConfig, llmCfg *llmConfig, bufferLimit uint32) error {
 	dfpHTTPFilter, err := buildDFPHTTPFilter(dnsCacheCfg)
 	if err != nil {
 		return fmt.Errorf("build dfp http filter: %w", err)
@@ -769,6 +816,19 @@ func (s *Server) rewriteHCM(fc *listenerv3.FilterChain, key egKey, dnsCacheCfg *
 			newFilters = append(newFilters, ours...)
 		}
 		hcm.HttpFilters = newFilters
+
+		// Raise-only, so larger ClientTrafficPolicy http2 windows win;
+		// see downstreamH2StreamWindowBytes. Over HTTP/2 the stream
+		// window, not the connection buffer limit, bounds what Envoy
+		// buffers for one stream, so it is kept at least as large as
+		// bufferLimit: a captured body that fits the HTTP/1.1 limit
+		// fits over HTTP/2 too.
+		if hcm.Http2ProtocolOptions == nil {
+			hcm.Http2ProtocolOptions = &corev3.Http2ProtocolOptions{}
+		}
+		streamWindow := max(uint32(downstreamH2StreamWindowBytes), bufferLimit)
+		raiseUInt32(&hcm.Http2ProtocolOptions.InitialStreamWindowSize, streamWindow)
+		raiseUInt32(&hcm.Http2ProtocolOptions.InitialConnectionWindowSize, max(uint32(downstreamH2ConnectionWindowBytes), 2*streamWindow))
 
 		// Replace whatever EG generated with the synthesized per-LLM-rule
 		// routes (pin-header matched, see llm.go) followed by a catch-all
@@ -1128,6 +1188,10 @@ func buildExtProcFilter(targetURI, authority string, creds *corev3.GrpcService_G
 			// that case, and AllowModeOverride below makes the promotion
 			// legal. Pattern from
 			// envoyproxy/ai-gateway internal/extproc/processor_impl.go:424.
+			// A response whose content type is outside the body-capture
+			// list is demoted to NONE the same way, so it streams
+			// through instead of being held whole for nothing (see
+			// onResponseHeaders).
 			ResponseBodyMode:    extprocv3.ProcessingMode_BUFFERED,
 			RequestTrailerMode:  extprocv3.ProcessingMode_SKIP,
 			ResponseTrailerMode: extprocv3.ProcessingMode_SKIP,

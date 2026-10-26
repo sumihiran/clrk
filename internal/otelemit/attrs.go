@@ -24,6 +24,11 @@ const (
 	AttrBodyTruncated = "clrk.body.truncated"
 	AttrBodyB64       = "clrk.body.b64"
 	AttrRespChunks    = "clrk.resp.chunks"
+	// AttrRespBodySkipped is emitted (true) only when the response body
+	// streamed through without being observed because its content type
+	// is outside the body-capture list; clrk.resp.bytes and
+	// clrk.resp.chunks are then 0 regardless of the body's real size.
+	AttrRespBodySkipped = "clrk.resp.body_skipped"
 
 	// AttrBodyContentEncoding names the wire content-encoding the captured
 	// body arrived in (e.g. "gzip", "br", "zstd"), emitted on a body span

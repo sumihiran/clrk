@@ -93,6 +93,13 @@ type Record struct {
 	// integration tests) can confirm the conditional STREAMED override
 	// promoted the mode for streaming traffic.
 	ResponseBodyChunks int
+	// ResponseBodySkipped is true when the response body was streamed
+	// through without reaching ext_proc (ResponseBodyMode=NONE override)
+	// because its content type is outside the capture list. The body's
+	// size is then unknown here — ResponseBody is empty and
+	// ResponseBodyChunks is 0 even for a non-empty body — so sinks emit
+	// clrk.resp.body_skipped to tell "not observed" apart from "0 bytes".
+	ResponseBodySkipped bool
 
 	// RequestBodyRewritten is true when ext_proc replaced the request
 	// body before forwarding (e.g. forcing OpenAI

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	egv1alpha1 "github.com/envoyproxy/gateway/api/v1alpha1"
@@ -79,6 +80,15 @@ const (
 	// solely so a clrk CR change makes EG's translated IR differ and
 	// forces the xds-translation pass that re-runs the extension hooks.
 	LLMRevHeaderName = "x-clrk-llm-rev"
+
+	// BufferRevHeaderName is the header name of a second IR-perturbing
+	// match, carrying the listener buffer limit the egextension derives
+	// from spec.otlp.captureBody.maxBytes when it departs from the
+	// default (EffectiveCapturedBodyBufferBytes). Same purpose as
+	// LLMRevHeaderName: the egextension sets the limit on the Envoy
+	// listener directly, so without the match a maxBytes edit would not
+	// reach Envoy until an unrelated change retranslated the gateway.
+	BufferRevHeaderName = "x-clrk-buffer-rev"
 )
 
 // listenerPort assigns a deterministic port per EgressListener index.
@@ -1016,6 +1026,8 @@ func (r *EgressGatewayReconciler) ensureGateway(ctx context.Context, eg *clrkv1a
 // xds-translation pass (and therefore the egextension hooks that
 // synthesize the per-rule LLM routes and clusters). The rule never
 // serves traffic — rewriteHCM replaces the whole route configuration.
+// A non-default listener buffer limit rides along the same way
+// (BufferRevHeaderName).
 func (r *EgressGatewayReconciler) ensureCatchAllRoute(ctx context.Context, eg *clrkv1alpha1.EgressGateway, llmRev string) error {
 	rt := &gwapiv1.HTTPRoute{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1068,6 +1080,18 @@ func (r *EgressGatewayReconciler) ensureCatchAllRoute(ctx context.Context, eg *c
 					Headers: []gwapiv1.HTTPHeaderMatch{{
 						Name:  gwapiv1.HTTPHeaderName(LLMRevHeaderName),
 						Value: llmRev,
+					}},
+				}},
+				BackendRefs: []gwapiv1.HTTPBackendRef{placeholderRef},
+			})
+		}
+		if limit := eg.Spec.EffectiveCapturedBodyBufferBytes(); limit != clrkv1alpha1.DefaultCapturedBodyBufferBytes {
+			// IR perturbation only, like the LLM revision rule above.
+			rt.Spec.Rules = append(rt.Spec.Rules, gwapiv1.HTTPRouteRule{
+				Matches: []gwapiv1.HTTPRouteMatch{{
+					Headers: []gwapiv1.HTTPHeaderMatch{{
+						Name:  gwapiv1.HTTPHeaderName(BufferRevHeaderName),
+						Value: strconv.FormatUint(uint64(limit), 10),
 					}},
 				}},
 				BackendRefs: []gwapiv1.HTTPBackendRef{placeholderRef},

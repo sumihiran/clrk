@@ -24,6 +24,9 @@ func (slogSink) Emit(r Record) {
 		"resp.body_bytes", len(r.ResponseBody),
 		"resp.truncated", r.ResponseTruncated,
 	}
+	if r.ResponseBodySkipped {
+		attrs = append(attrs, "resp.body_skipped", true)
+	}
 	if r.Provider != nil {
 		// gen_ai.* attributes for the AI-provider acceptance line. These
 		// match the keys we publish on the OTLP sink so log greps are

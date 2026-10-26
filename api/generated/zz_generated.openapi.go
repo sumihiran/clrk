@@ -1572,14 +1572,14 @@ func schema_clrk_api_clrk_v1alpha1_BodyCaptureSpec(ref common.ReferenceCallback)
 				Properties: map[string]spec.Schema{
 					"maxBytes": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MaxBytes caps the captured body size per direction. Bodies larger than this are truncated; the log record carries a truncated marker.",
+							Description: "MaxBytes caps the captured body size per direction. Bodies larger than this are truncated; the log record carries a truncated marker.\n\nIt also sizes the proxy's buffers on HTTP listeners: a non-streamed response whose content type is captured is held whole before it is released, so it can be at most the larger of MaxBytes and 4 MiB (capped at 64 MiB; see EffectiveCapturedBodyBufferBytes) over HTTP/1.1, and at most the larger of that and 16 MiB (the downstream HTTP/2 stream window) over HTTP/2. A larger captured response fails with HTTP 500. Larger ClientTrafficPolicy connection.bufferLimit or http2 window values still win.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
 					},
 					"includeContentTypes": {
 						SchemaProps: spec.SchemaProps{
-							Description: "IncludeContentTypes limits body capture to these Content-Type prefixes. Empty means the default set (application/json, application/x-ndjson, text/event-stream).",
+							Description: "IncludeContentTypes limits body capture to these Content-Type prefixes. Empty means the default set (application/json, application/x-ndjson, text/event-stream).\n\nA response whose content type is outside this set (package downloads, archives, image layers) streams through without being buffered or observed: its record carries clrk.resp.body_skipped and no response body or byte count. Streamed responses (text/event-stream, x-ndjson, or a request that asked for a stream), cross-schema translated responses, and responses to bodyless requests are not affected.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{

@@ -418,10 +418,36 @@ func (ds *downstreamStream) onResponseHeaders(m *extprocv3.HttpHeaders, now time
 			return translation502(ds.xlate.src.Name, "clrk: cross-schema translation does not support streaming responses")
 		}
 	}
-	if !capture.ContentTypeIncluded(ds.rec.ResponseHeaders["content-type"], ds.includedTypes) {
+	captured := capture.ContentTypeIncluded(ds.rec.ResponseHeaders["content-type"], ds.includedTypes)
+	if !captured {
 		ds.respBytesLeft = 0
 	}
 	ds.respKeepLast = respIsStreaming
+	// A body nothing will read streams straight through. With no override
+	// set above the response would stay on the filter's static BUFFERED
+	// mode: Envoy would hold the whole body (package downloads, archives,
+	// image layers) before releasing it, and fail it with a 500 once it
+	// outgrew the buffer limit or the ext_proc gRPC message ceiling —
+	// only for ext_proc to drop it here, since its content type is
+	// outside the capture list. Skipped only when no other consumer needs
+	// the bytes: no stream promotion (token accounting reads streamed
+	// bodies through the keep-last ring even when their type isn't
+	// captured), no cross-schema translation, and not a streamed
+	// content type.
+	//
+	// NONE, not STREAMED: STREAMED would yield a byte count but costs an
+	// Envoy<->ext_proc round trip per chunk, which on a multi-gigabyte
+	// download is pure overhead for a number Envoy's access log
+	// (%BYTES_SENT%) already records. The record marks the body as not
+	// observed instead (ResponseBodySkipped), so a skipped body is never
+	// mistaken for an empty one.
+	if resp.ModeOverride == nil && ds.xlate == nil && !captured && !respIsStreaming && !m.GetEndOfStream() {
+		resp.ModeOverride = modeOverride(
+			extprocfilterv3.ProcessingMode_NONE,
+			extprocfilterv3.ProcessingMode_NONE,
+		)
+		ds.rec.ResponseBodySkipped = true
+	}
 	return resp
 }
 
