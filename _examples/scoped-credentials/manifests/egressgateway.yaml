@@ -1,0 +1,14 @@
+apiVersion: clrk.apoxy.dev/v1alpha1
+kind: EgressGateway
+metadata:
+  name: scoped-credentials
+spec:
+  # Only the destinations the EgressL4Routes below allow are reachable.
+  defaultPolicy: deny-all
+  listeners:
+    # Credentials are injected into HTTP requests, so the listener has
+    # to terminate TLS. TLS-passthrough and TCP listeners never inject.
+    - name: egress-mitm
+      protocol: TLS
+      tls:
+        mode: Terminate

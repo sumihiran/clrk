@@ -687,7 +687,7 @@ func (ds *downstreamStream) redactViableInjections(final *routeRule, viable []re
 	seen := map[string]bool{}
 	var injUnion []credInjection
 	for _, c := range viable {
-		for _, inj := range ds.creds.lookupForBackend(final, c.name) {
+		for _, inj := range ds.creds.lookupForBackend(final, c.name, destFromBackend(c.host, c.port)) {
 			fresh := false
 			for _, name := range inj.headerNames() {
 				if !seen[name] {
@@ -1039,8 +1039,10 @@ func decodeForParse(body []byte, contentEncoding string, truncated bool) (out []
 // lookupCreds matches the request to an APR (if any) and returns the
 // credentials that should be injected. Pure read against pre-resolved
 // tables; called from the RequestHeaders branch where we do header
-// mutation. Returns an empty slice when no CIPs attach to this
-// transaction.
+// mutation. EgressL4Route-scoped policies match the effective
+// :authority (port default applied), so they apply to any host, not only
+// the ones the provider registry knows. Returns an empty slice when no
+// CIPs attach to this transaction.
 func lookupCreds(creds *credTable, routes *routeTable, headers map[string]string) []credInjection {
 	if creds == nil {
 		return nil
@@ -1052,7 +1054,7 @@ func lookupCreds(creds *credTable, routes *routeTable, headers map[string]string
 			rr = routes.match(system, headers[":path"], "")
 		}
 	}
-	return creds.lookup(rr)
+	return creds.lookup(rr, destFromAuthority(headers[":authority"]))
 }
 
 // provisionalMatch is the model-blind header-time match used to decide
@@ -1095,15 +1097,17 @@ func provisionalMatch(routes *routeTable, headers map[string]string) *routeRule 
 	return routes.match(parsers.SystemFor(host), headers[":path"], "")
 }
 
-// injectFallbackCreds builds a header mutation injecting rr's route-wide
-// (and gateway) credentials, redacting them from the captured record.
+// injectFallbackCreds builds a header mutation injecting rr's route-wide,
+// destination-scoped (matched against the header-time :authority, which
+// is where the fallback sends the request) and gateway credentials,
+// redacting them from the captured record.
 // Used on the re-selection fallback paths (truncated body, no resolvable
 // candidate) so a deferred-credential request still authenticates against
 // its original host. Route-wide SigV4 policies sign here too — body and
 // reqPath must be the final wire values. Returns nil when there is
 // nothing to inject.
 func injectFallbackCreds(creds *credTable, rr *routeRule, headers map[string]string, body []byte, reqPath string, logger logr.Logger) *extprocv3.HeaderMutation {
-	injs := creds.lookup(rr)
+	injs := creds.lookup(rr, destFromAuthority(headers[":authority"]))
 	if len(injs) == 0 {
 		return nil
 	}

@@ -1,0 +1,29 @@
+# Each route is both an allowlist entry and the destination scope of the
+# CredentialInjectionPolicy that targets it.
+apiVersion: clrk.apoxy.dev/v1alpha1
+kind: EgressL4Route
+metadata:
+  name: example-api
+spec:
+  parentRefs:
+    - group: clrk.apoxy.dev
+      kind: EgressGateway
+      name: scoped-credentials
+  rules:
+    - matches:
+        - destinationHostnames: ["api.example.com"]
+          ports: [{port: 443}]
+---
+apiVersion: clrk.apoxy.dev/v1alpha1
+kind: EgressL4Route
+metadata:
+  name: internal-registry
+spec:
+  parentRefs:
+    - group: clrk.apoxy.dev
+      kind: EgressGateway
+      name: scoped-credentials
+  rules:
+    - matches:
+        - destinationHostnames: ["registry.internal"]
+          ports: [{port: 8443}]

@@ -485,7 +485,7 @@ func (p *CredentialInjectionPolicy) Validate(_ context.Context) field.ErrorList 
 	if len(p.Spec.TargetRefs) == 0 {
 		errs = append(errs, field.Required(specPath.Child("targetRefs"), "at least one targetRef is required"))
 	}
-	supportedKinds := []string{"AIProviderRoute", "MCPRoute", "EgressGateway"}
+	supportedKinds := []string{"AIProviderRoute", "MCPRoute", "EgressGateway", "EgressL4Route"}
 	for i, ref := range p.Spec.TargetRefs {
 		rp := specPath.Child("targetRefs").Index(i)
 		// The credential table joins on an explicit clrk.apoxy.dev
@@ -496,8 +496,8 @@ func (p *CredentialInjectionPolicy) Validate(_ context.Context) field.ErrorList 
 			supportedKinds, rp)...)
 		// A sectionName names a BackendRef on an AIProviderRoute target and
 		// gates injection to that backend; on a supported-but-non-APR kind
-		// (EgressGateway/MCPRoute) it has nothing to bind to and would
-		// silently never scope. Only flagged for a recognized non-APR kind —
+		// (EgressGateway/MCPRoute/EgressL4Route, whose rules are unnamed) it
+		// has nothing to bind to and would silently never scope. Only flagged for a recognized non-APR kind —
 		// an unsupported kind is already covered by the kind error above.
 		if slices.Contains(supportedKinds, string(ref.Kind)) && string(ref.Kind) != "AIProviderRoute" &&
 			ref.SectionName != nil && *ref.SectionName != "" {

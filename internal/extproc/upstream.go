@@ -195,7 +195,7 @@ func (us *upstreamStream) onRequestHeaders(m *extprocv3.HttpHeaders) *extprocv3.
 // calls that reach this path.
 func (us *upstreamStream) commitBodyless() *extprocv3.ProcessingResponse {
 	st, cand := us.state, us.cand
-	injs := us.creds.lookupForBackend(st.rule, cand.name)
+	injs := us.creds.lookupForBackend(st.rule, cand.name, destFromBackend(cand.host, cand.port))
 	mut := us.repointAndInject(injs, nil)
 	st.appendAttempt(attemptFact{
 		backendNamespace: cand.namespace,
@@ -237,7 +237,7 @@ func (us *upstreamStream) onRequestBody(m *extprocv3.HttpBody) *extprocv3.Proces
 		return bodyContinue(true)
 	}
 	st, cand := us.state, us.cand
-	injs := us.creds.lookupForBackend(st.rule, cand.name)
+	injs := us.creds.lookupForBackend(st.rule, cand.name, destFromBackend(cand.host, cand.port))
 
 	// Custom rules are operator-vouched passthrough: clrk cannot verify
 	// schema parity (often there is no recognized source schema at

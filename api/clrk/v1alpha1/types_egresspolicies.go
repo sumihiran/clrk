@@ -64,9 +64,9 @@ type ProviderAuthConfig struct {
 // CredentialInjectionSpec defines the desired state of a CredentialInjectionPolicy.
 type CredentialInjectionSpec struct {
 	// TargetRefs attaches this policy DOWN onto AIProviderRoute, MCPRoute,
-	// or EgressGateway targets (GEP-2648 Direct Policy Attachment). The
-	// proxy applies the credential to traffic matching the referenced
-	// target. Plural so one policy can cover several targets;
+	// EgressL4Route, or EgressGateway targets (GEP-2648 Direct Policy
+	// Attachment). The proxy applies the credential to traffic matching the
+	// referenced target. Plural so one policy can cover several targets;
 	// LocalPolicyTargetReferenceWithSectionName is same-namespace by
 	// construction (cross-namespace attachment requires a ReferenceGrant).
 	//
@@ -77,8 +77,36 @@ type CredentialInjectionSpec struct {
 	//     backend; an empty sectionName injects route-wide.
 	//   - MCPRoute: applies when the request matches that route
 	//     (no-op until MCPRoute consumption ships).
+	//   - EgressL4Route: applies to HTTP(S) requests on the gateways the
+	//     route parent-refs whose destination matches one of the route's
+	//     rule matches, with the route's own semantics:
+	//     destinationHostnames (exact, or a wildcard matching exactly one
+	//     prefix label), destinationCIDRs (for IP-literal destinations) and
+	//     ports (single ports and ranges). The destination is where the
+	//     proxy actually sends the request: the :authority host and port,
+	//     with 443 assumed when the agent omits the port. It is never the
+	//     TLS SNI, so a request whose Host differs from its SNI gets the
+	//     credential of the Host it is sent to. For a request re-pointed to
+	//     a Backend selected by an AIProviderRoute, the destination is that
+	//     Backend's host:port. A match block using sourceAgents, or carrying
+	//     an unparseable CIDR or port range, is ignored for credential
+	//     scoping (it can't be honored at the proxy), and a match block with
+	//     no criteria matches every destination. Only listeners that
+	//     terminate TLS (or plain HTTP) see the request, so traffic on
+	//     TLS-passthrough and TCP listeners is never injected. sectionName
+	//     is not supported (EgressL4Route rules are unnamed).
 	//   - EgressGateway: catch-all for any traffic on the gateway that
 	//     no narrower policy claimed.
+	//
+	// When several policies apply to one request, the narrowest wins per
+	// header: an AIProviderRoute backend-scoped (sectionName) policy, then an
+	// AIProviderRoute route-wide one, then an EgressL4Route-scoped one, then
+	// the EgressGateway catch-all. A broader policy is dropped when a
+	// narrower one sets any of the same headers (an AWSv4 ProviderAuth
+	// policy sets Authorization plus its X-Amz-* headers), and only fills in
+	// headers no narrower policy sets. Ties at one level resolve to the
+	// first policy by name. No match means no injection: whatever the agent
+	// sent, typically a placeholder, passes through unchanged.
 	TargetRefs []gwapiv1a2.LocalPolicyTargetReferenceWithSectionName `json:"targetRefs"`
 
 	// SecretRef points at a K8s Secret containing the credential. The

@@ -127,7 +127,14 @@ func (r *sinkRegistry) get(ctx context.Context) (*egSink, error) {
 	if err := r.client.List(ctx, &cips); err != nil {
 		return nil, fmt.Errorf("list CredentialInjectionPolicies: %w", err)
 	}
-	credVersion := CredPoliciesVersion(ctx, r.client, cips.Items, aprs.Items, key)
+	// EgressL4Routes scope CIPs that target them to the destinations the
+	// route matches; listed cluster-wide like APRs since a route in any
+	// namespace can parent-ref this EG.
+	var l4Routes clrkv1alpha1.EgressL4RouteList
+	if err := r.client.List(ctx, &l4Routes); err != nil {
+		return nil, fmt.Errorf("list EgressL4Routes: %w", err)
+	}
+	credVersion := CredPoliciesVersion(ctx, r.client, cips.Items, aprs.Items, l4Routes.Items, key)
 
 	// List Backends cluster-wide for the same reason as APRs: a Backend
 	// in any namespace can be referenced by an attached route's
@@ -168,7 +175,7 @@ func (r *sinkRegistry) get(ctx context.Context) (*egSink, error) {
 	built.backendsVersion = backendVersion
 	built.mcpRoutes = buildMCPRouteTable(ctx, key.Namespace, key.Name, mcprs.Items)
 	built.mcpRoutesVersion = mcpVersion
-	built.creds = buildCredTable(ctx, r.client, key.Namespace, key.Name, aprs.Items, cips.Items)
+	built.creds = buildCredTable(ctx, r.client, key.Namespace, key.Name, aprs.Items, l4Routes.Items, cips.Items)
 	built.credsVersion = credVersion
 
 	r.mu.Lock()

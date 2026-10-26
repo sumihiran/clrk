@@ -135,6 +135,11 @@ type EgressL4RouteStatus struct {
 // EgressL4Route provides destination CIDR, port, and protocol matching
 // for raw L4 egress traffic.
 //
+// A CredentialInjectionPolicy can target an EgressL4Route to scope a
+// credential to the destinations the route matches; see
+// CredentialInjectionSpec.TargetRefs for how the matches apply to HTTP
+// requests.
+//
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true

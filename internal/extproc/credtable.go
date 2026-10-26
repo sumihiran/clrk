@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -15,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	clrkv1alpha1 "github.com/apoxy-dev/clrk/api/clrk/v1alpha1"
+	"github.com/apoxy-dev/clrk/internal/egress"
 	"github.com/apoxy-dev/clrk/internal/extproc/awssigv4"
 	"github.com/apoxy-dev/clrk/internal/policyattach"
 )
@@ -23,6 +25,7 @@ import (
 const (
 	aiProviderRouteKind = "AIProviderRoute"
 	mcpRouteKind        = "MCPRoute"
+	egressL4RouteKind   = "EgressL4Route"
 )
 
 // credInjection is one resolved CredentialInjectionPolicy ready for
@@ -74,19 +77,69 @@ func (i credInjection) headerNames() []string {
 }
 
 // credTable holds resolved CredentialInjectionPolicies attached to one
-// EgressGateway (directly or via an APR that parent-refs this EG). Built
-// alongside the routeTable in sinks.go and read on the request hot path
-// by lookup().
+// EgressGateway (directly, via an APR that parent-refs this EG, or via an
+// EgressL4Route that parent-refs it). Built alongside the routeTable in
+// sinks.go and read on the request hot path by lookup().
 //
-// MVP only honors Target=Header. QueryParam and ProviderAuth policies
-// are silently skipped at build time (file follow-ups).
+// Header and ProviderAuth/AWSv4 targets are honored; QueryParam and
+// other ProviderAuth types are log-skipped at build time.
+//
+// When several policies apply to one request, the narrowest one wins per
+// header (see lookupForBackend): an APR backend-scoped policy over an APR
+// route-wide one, over an EgressL4Route-scoped one, over the EgressGateway
+// catch-all.
 type credTable struct {
-	// byRoute keys credentials by (namespace, name) of the APR/MCPRoute
-	// the policy parents to. Multiple policies on the same route stack.
+	// byRoute keys credentials by (namespace, name) of the APR the
+	// policy targets. Multiple policies on the same route stack.
 	byRoute map[types.NamespacedName][]credInjection
-	// gateway holds policies that parent directly to the EG. Always
-	// applied on top of any matched-route credentials.
+	// byDestination holds policies that target an EgressL4Route attached
+	// to this EG. Each applies only when the request's effective
+	// destination matches one of that route's rule matches.
+	byDestination []destCredInjection
+	// gateway holds policies that target the EG itself: the catch-all
+	// for any header no narrower matched policy sets.
 	gateway []credInjection
+}
+
+// destCredInjection is a credential scoped to the destinations one
+// EgressL4Route matches.
+type destCredInjection struct {
+	inj     credInjection
+	matcher *egress.DestinationMatcher
+}
+
+// credDest is a request's effective destination: the host and port the
+// proxy dials once the :authority port default is applied (or a selected
+// backend's host:port on the per-attempt path). The zero value means the
+// destination is unknown, which matches no destination-scoped policy.
+type credDest struct {
+	host string
+	port uint16
+}
+
+// destFromAuthority derives the effective destination from a request's
+// :authority as the agent sent it. effectiveAuthority applies the same
+// :443 default authorityPortMutation writes before the dynamic forward
+// proxy parses host:port, so matching runs against where the request
+// actually goes — never the SNI, which the agent controls independently.
+// An authority without a parseable port yields the zero credDest.
+func destFromAuthority(authority string) credDest {
+	host, portStr := splitHostPort(effectiveAuthority(authority))
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if host == "" || err != nil || port == 0 {
+		return credDest{}
+	}
+	return credDest{host: host, port: uint16(port)}
+}
+
+// destFromBackend is the effective destination of an attempt re-pointed
+// to a selected backend: the host:port the upstream filter writes onto
+// :authority (see repointAndInject).
+func destFromBackend(host string, port int) credDest {
+	if host == "" || port <= 0 || port > 65535 {
+		return credDest{}
+	}
+	return credDest{host: host, port: uint16(port)}
 }
 
 func newEmptyCredTable() *credTable {
@@ -94,16 +147,17 @@ func newEmptyCredTable() *credTable {
 }
 
 // buildCredTable resolves the set of CredentialInjectionPolicies that
-// attach to (egNamespace, egName) — directly or via an APR — reads their
-// Secrets via the cached client, and returns the lookup table. Errors
-// fetching individual Secrets (missing, malformed) are logged and the
-// offending policy is skipped; one bad CIP must not break others on the
-// same EG.
+// attach to (egNamespace, egName) — directly, via an APR, or via an
+// EgressL4Route — reads their Secrets via the cached client, and returns
+// the lookup table. Errors fetching individual Secrets (missing,
+// malformed) are logged and the offending policy is skipped; one bad CIP
+// must not break others on the same EG.
 func buildCredTable(
 	ctx context.Context,
 	c client.Client,
 	egNamespace, egName string,
 	aprs []clrkv1alpha1.AIProviderRoute,
+	l4Routes []clrkv1alpha1.EgressL4Route,
 	cips []clrkv1alpha1.CredentialInjectionPolicy,
 ) *credTable {
 	log := logr.FromContextOrDiscard(ctx).WithName("credtable")
@@ -114,6 +168,7 @@ func buildCredTable(
 			aprAttached[types.NamespacedName{Namespace: r.Namespace, Name: r.Name}] = true
 		}
 	}
+	l4Attached := attachedL4Routes(l4Routes, egNamespace, egName)
 
 	tbl := newEmptyCredTable()
 	for i := range cips {
@@ -147,6 +202,17 @@ func buildCredTable(
 					inj.section = policyattach.Section(ref)
 					tbl.byRoute[key] = append(tbl.byRoute[key], *inj)
 				}
+			case egressL4RouteKind:
+				route, ok := l4Attached[types.NamespacedName{Namespace: cip.Namespace, Name: refName}]
+				if !ok {
+					continue
+				}
+				if inj := resolveCIP(ctx, c, cip, log); inj != nil {
+					tbl.byDestination = append(tbl.byDestination, destCredInjection{
+						inj:     *inj,
+						matcher: egress.NewDestinationMatcher(*route),
+					})
+				}
 			case mcpRouteKind:
 				// CIPs targeting MCPRoute are a separate follow-up
 				// item; APO-556 ships MCPRoute matching + ToolPolicy
@@ -156,7 +222,33 @@ func buildCredTable(
 			}
 		}
 	}
+
+	// Cluster list order isn't stable across calls; sort each bucket by
+	// policy name so same-precedence ties resolve the same way on every
+	// rebuild (see claimHeaders).
+	for k := range tbl.byRoute {
+		sortByPolicy(tbl.byRoute[k], func(i credInjection) string { return i.policyName })
+	}
+	sortByPolicy(tbl.byDestination, func(d destCredInjection) string { return d.inj.policyName })
+	sortByPolicy(tbl.gateway, func(i credInjection) string { return i.policyName })
 	return tbl
+}
+
+// attachedL4Routes indexes the EgressL4Routes that parent-ref the EG by
+// namespace/name, using the attachment rule of the dial-time allowlist.
+func attachedL4Routes(routes []clrkv1alpha1.EgressL4Route, egNamespace, egName string) map[types.NamespacedName]*clrkv1alpha1.EgressL4Route {
+	out := map[types.NamespacedName]*clrkv1alpha1.EgressL4Route{}
+	for i := range routes {
+		r := &routes[i]
+		if egress.RouteAttachesTo(*r, egNamespace, egName) {
+			out[types.NamespacedName{Namespace: r.Namespace, Name: r.Name}] = r
+		}
+	}
+	return out
+}
+
+func sortByPolicy[T any](s []T, name func(T) string) {
+	sort.SliceStable(s, func(i, j int) bool { return name(s[i]) < name(s[j]) })
 }
 
 // resolveCIP loads the referenced Secret and produces a credInjection.
@@ -265,38 +357,80 @@ func loadCIPSecret(ctx context.Context, c client.Client, cip *clrkv1alpha1.Crede
 }
 
 // lookup returns the credentials applied at RequestHeaders time for a
-// transaction matched against the given route: route-wide entries (no
-// sectionName) first, gateway catch-all stacked on top. Backend-scoped
-// entries (a sectionName naming a specific backend) are deliberately
-// excluded here — they fire only after that backend is selected
-// post-body (see lookupForBackend). Pass rr=nil for transactions that
-// matched no APR (gateway-only). This preserves today's behavior exactly
-// for routes that use no sectionName.
-func (t *credTable) lookup(rr *routeRule) []credInjection {
-	return t.lookupForBackend(rr, "")
+// transaction matched against the given route and headed to dest.
+// Backend-scoped entries (a sectionName naming a specific backend) are
+// deliberately excluded here — they fire only after that backend is
+// selected post-body (see lookupForBackend). Pass rr=nil for transactions
+// that matched no APR.
+func (t *credTable) lookup(rr *routeRule, dest credDest) []credInjection {
+	return t.lookupForBackend(rr, "", dest)
 }
 
-// lookupForBackend returns the credentials to inject once `backend` (a
-// BackendRef name) has been selected post-body: route-wide entries plus
-// any whose sectionName matches `backend`, plus the gateway catch-all.
-// Passing backend="" yields only the route-wide + gateway set, i.e. the
-// header-time behavior of lookup.
-func (t *credTable) lookupForBackend(rr *routeRule, backend string) []credInjection {
+// lookupForBackend returns the credentials to inject for a request that
+// matched rr, had `backend` (a BackendRef name, "" before selection)
+// selected, and is headed to dest. Candidates are considered narrowest
+// first:
+//
+//  1. rr's entries whose sectionName names backend,
+//  2. rr's route-wide entries (no sectionName),
+//  3. EgressL4Route-scoped entries whose route matches dest,
+//  4. the EgressGateway catch-all.
+//
+// An entry is dropped when a narrower one already sets any of the same
+// headers, so a broader policy only fills in headers nothing narrower
+// claimed — the documented "catch-all" semantics of an EgressGateway
+// target. Within one level, the first policy by namespace/name wins.
+func (t *credTable) lookupForBackend(rr *routeRule, backend string, dest credDest) []credInjection {
 	if t == nil {
 		return nil
 	}
-	var out []credInjection
+	var routeEntries []credInjection
 	if rr != nil {
-		for _, inj := range t.byRoute[types.NamespacedName{Namespace: rr.routeNamespace, Name: rr.routeName}] {
-			if inj.section == "" || (backend != "" && inj.section == backend) {
-				out = append(out, inj)
+		routeEntries = t.byRoute[types.NamespacedName{Namespace: rr.routeNamespace, Name: rr.routeName}]
+	}
+	claimed := map[string]bool{}
+	var out []credInjection
+	if backend != "" {
+		for _, inj := range routeEntries {
+			if inj.section == backend {
+				out = claimHeaders(out, inj, claimed)
 			}
 		}
 	}
-	if len(t.gateway) > 0 {
-		out = append(out, t.gateway...)
+	for _, inj := range routeEntries {
+		if inj.section == "" {
+			out = claimHeaders(out, inj, claimed)
+		}
+	}
+	if dest.host != "" {
+		for _, d := range t.byDestination {
+			if d.matcher.MatchAuthority(dest.host, dest.port) {
+				out = claimHeaders(out, d.inj, claimed)
+			}
+		}
+	}
+	for _, inj := range t.gateway {
+		out = claimHeaders(out, inj, claimed)
 	}
 	return out
+}
+
+// claimHeaders appends inj to out unless a previously claimed (narrower or
+// same-level earlier) injection already sets one of its headers, and
+// records the headers inj sets. Header names are compared lower-cased,
+// and a SigV4 entry claims its whole signature set, so a static
+// Authorization header and an AWSv4 signature can never both be applied.
+func claimHeaders(out []credInjection, inj credInjection, claimed map[string]bool) []credInjection {
+	names := inj.headerNames()
+	for _, n := range names {
+		if claimed[n] {
+			return out
+		}
+	}
+	for _, n := range names {
+		claimed[n] = true
+	}
+	return append(out, inj)
 }
 
 // applyInjections appends SetHeaders entries to (or builds) a
@@ -367,11 +501,16 @@ func redactInjected(headers map[string]string, injs []credInjection) (collisions
 }
 
 // CredPoliciesVersion fingerprints the CIPs that attach to the given
-// EG (directly or via an APR). Mirrors aiproviderRoutesVersion in
-// shape: sorted parts list, one per matched CIP, encoding the CIP's
-// own ResourceVersion AND the ResourceVersion of its referenced
-// Secret. Used by sinkRegistry to decide whether to rebuild the
-// cached egSink.
+// EG (directly, via an APR, or via an EgressL4Route). Mirrors
+// aiproviderRoutesVersion in shape: sorted parts list, one per matched
+// CIP, encoding the CIP's own ResourceVersion AND the ResourceVersion of
+// its referenced Secret. Used by sinkRegistry to decide whether to
+// rebuild the cached egSink.
+//
+// For a CIP that targets EgressL4Routes, the part also carries each
+// attached route's ResourceVersion: the route's rule matches ARE the
+// policy's destination scope, so editing them must rebuild the table
+// without a restart.
 //
 // Including the Secret's RV is what makes credential rotation
 // propagate without operator intervention: a Secret rotation bumps
@@ -389,6 +528,7 @@ func CredPoliciesVersion(
 	c client.Client,
 	cips []clrkv1alpha1.CredentialInjectionPolicy,
 	aprs []clrkv1alpha1.AIProviderRoute,
+	l4Routes []clrkv1alpha1.EgressL4Route,
 	eg types.NamespacedName,
 ) string {
 	aprAttached := map[types.NamespacedName]bool{}
@@ -397,11 +537,13 @@ func CredPoliciesVersion(
 			aprAttached[types.NamespacedName{Namespace: r.Namespace, Name: r.Name}] = true
 		}
 	}
+	l4Attached := attachedL4Routes(l4Routes, eg.Namespace, eg.Name)
 
 	var parts []string
 	for i := range cips {
 		cip := &cips[i]
 		matched := false
+		var routeVersions []string
 		for _, ref := range cip.Spec.TargetRefs {
 			if string(ref.Group) != clrkAPIGroup {
 				continue
@@ -409,24 +551,32 @@ func CredPoliciesVersion(
 			// Same-namespace targetRefs: the target is in the CIP's own
 			// namespace (mirrors buildCredTable, which the fingerprint must
 			// agree with or the cached sink desyncs from the built table).
+			key := types.NamespacedName{Namespace: cip.Namespace, Name: string(ref.Name)}
 			switch string(ref.Kind) {
 			case egressGatewayKind:
 				if cip.Namespace == eg.Namespace && string(ref.Name) == eg.Name {
 					matched = true
 				}
 			case aiProviderRouteKind:
-				if aprAttached[types.NamespacedName{Namespace: cip.Namespace, Name: string(ref.Name)}] {
+				if aprAttached[key] {
 					matched = true
 				}
-			}
-			if matched {
-				break
+			case egressL4RouteKind:
+				if r, ok := l4Attached[key]; ok {
+					matched = true
+					routeVersions = append(routeVersions, key.String()+"@"+r.ResourceVersion)
+				}
 			}
 		}
 		if matched {
-			parts = append(parts, fmt.Sprintf("%s/%s@%s+%s",
+			part := fmt.Sprintf("%s/%s@%s+%s",
 				cip.Namespace, cip.Name, cip.ResourceVersion,
-				secretVersion(ctx, c, cip)))
+				secretVersion(ctx, c, cip))
+			if len(routeVersions) > 0 {
+				sort.Strings(routeVersions)
+				part += "+" + strings.Join(routeVersions, "+")
+			}
+			parts = append(parts, part)
 		}
 	}
 	sort.Strings(parts)

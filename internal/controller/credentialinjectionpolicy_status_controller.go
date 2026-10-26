@@ -16,6 +16,7 @@ import (
 	gwapiv1a2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
 	clrkv1alpha1 "github.com/apoxy-dev/clrk/api/clrk/v1alpha1"
+	"github.com/apoxy-dev/clrk/internal/egress"
 )
 
 // credentialInjectionPolicyController is the controller name stamped on the
@@ -32,7 +33,7 @@ var cipPendingKinds = map[string]bool{"MCPRoute": true}
 // CredentialInjectionPolicyStatusReconciler writes the GEP-2649 PolicyStatus
 // of a CredentialInjectionPolicy: one ancestor per targetRef with an Accepted
 // condition reporting whether the (same-namespace) EgressGateway / AIProviderRoute
-// / MCPRoute target exists. It is status-only — the worker resolves and applies
+// / MCPRoute / EgressL4Route target exists. It is status-only — the worker resolves and applies
 // the credential off the policy spec — so a typo'd or dangling targetRef
 // surfaces as Accepted=False/TargetNotFound instead of silently never injecting.
 type CredentialInjectionPolicyStatusReconciler struct {
@@ -45,6 +46,7 @@ type CredentialInjectionPolicyStatusReconciler struct {
 // +kubebuilder:rbac:groups=clrk.apoxy.dev,resources=egressgateways,verbs=get;list;watch
 // +kubebuilder:rbac:groups=clrk.apoxy.dev,resources=aiproviderroutes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=clrk.apoxy.dev,resources=mcproutes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=clrk.apoxy.dev,resources=egressl4routes,verbs=get;list;watch
 
 func (r *CredentialInjectionPolicyStatusReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var cip clrkv1alpha1.CredentialInjectionPolicy
@@ -67,7 +69,11 @@ func (r *CredentialInjectionPolicyStatusReconciler) Reconcile(ctx context.Contex
 	}
 
 	resolve := func(ctx context.Context, ref gwapiv1a2.LocalPolicyTargetReferenceWithSectionName) (ancestorCondition, error) {
-		return baseTargetCondition(ctx, r.Client, cip.Namespace, ref, cipPendingKinds)
+		ac, err := baseTargetCondition(ctx, r.Client, cip.Namespace, ref, cipPendingKinds)
+		if err != nil || ac.status != metav1.ConditionTrue || string(ref.Kind) != "EgressL4Route" {
+			return ac, err
+		}
+		return r.l4RouteScopeCondition(ctx, cip.Namespace, string(ref.Name), ac)
 	}
 	ancestors, err := policyAncestors(ctx, cip.Namespace, cip.Spec.TargetRefs,
 		cip.Generation, credentialInjectionPolicyController, existing, resolve)
@@ -85,6 +91,40 @@ func (r *CredentialInjectionPolicyStatusReconciler) Reconcile(ctx context.Contex
 	return ctrl.Result{}, nil
 }
 
+// l4RouteScopeCondition refines an Accepted verdict for an EgressL4Route
+// target. The route's rule matches are the policy's destination scope, and
+// the data plane compiles them strictly (egress.DestinationMatcher): a match
+// block using sourceAgents, or carrying an unparseable CIDR or port range,
+// is ignored rather than widened. A route left with no usable block can
+// never inject, so it must not report Accepted; one with some blocks
+// ignored stays Accepted but says so.
+func (r *CredentialInjectionPolicyStatusReconciler) l4RouteScopeCondition(ctx context.Context, namespace, name string, ac ancestorCondition) (ancestorCondition, error) {
+	var route clrkv1alpha1.EgressL4Route
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &route); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Deleted between the existence check and here; the route
+			// watch re-enqueues and the next pass reports TargetNotFound.
+			return ac, nil
+		}
+		return ancestorCondition{}, err
+	}
+	usable, dropped := egress.NewDestinationMatcher(route).Counts()
+	switch {
+	case usable == 0:
+		return ancestorCondition{
+			status: metav1.ConditionFalse,
+			reason: string(gwapiv1a2.PolicyReasonInvalid),
+			message: fmt.Sprintf("EgressL4Route %s/%s has no rule match usable for credential scoping "+
+				"(matches with sourceAgents, invalid CIDRs or invalid port ranges are ignored); the credential is never injected",
+				namespace, name),
+		}, nil
+	case dropped > 0:
+		ac.message = fmt.Sprintf("%s; %d of %d rule matches ignored for credential scoping "+
+			"(sourceAgents, invalid CIDRs or invalid port ranges)", ac.message, dropped, usable+dropped)
+	}
+	return ac, nil
+}
+
 func (r *CredentialInjectionPolicyStatusReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("credentialinjectionpolicy-status").
@@ -92,6 +132,7 @@ func (r *CredentialInjectionPolicyStatusReconciler) SetupWithManager(mgr ctrl.Ma
 		Watches(&clrkv1alpha1.EgressGateway{}, handler.EnqueueRequestsFromMapFunc(r.policiesForTarget("EgressGateway"))).
 		Watches(&clrkv1alpha1.AIProviderRoute{}, handler.EnqueueRequestsFromMapFunc(r.policiesForTarget("AIProviderRoute"))).
 		Watches(&clrkv1alpha1.MCPRoute{}, handler.EnqueueRequestsFromMapFunc(r.policiesForTarget("MCPRoute"))).
+		Watches(&clrkv1alpha1.EgressL4Route{}, handler.EnqueueRequestsFromMapFunc(r.policiesForTarget("EgressL4Route"))).
 		Complete(r)
 }
 

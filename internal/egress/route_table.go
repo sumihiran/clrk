@@ -118,22 +118,146 @@ func hostnameMatches(rule, candidate string) bool {
 func routesForEG(routes []clrkv1alpha1.EgressL4Route, egNamespace, egName string) []clrkv1alpha1.EgressL4Route {
 	var out []clrkv1alpha1.EgressL4Route
 	for _, r := range routes {
-		for _, ref := range r.Spec.ParentRefs {
-			if string(ref.Name) != egName {
-				continue
-			}
-			ns := r.Namespace
-			if ref.Namespace != nil {
-				ns = string(*ref.Namespace)
-			}
-			if ns != egNamespace {
-				continue
-			}
+		if RouteAttachesTo(r, egNamespace, egName) {
 			out = append(out, r)
-			break
 		}
 	}
 	return out
+}
+
+// RouteAttachesTo reports whether any of the route's ParentRefs targets
+// the given EG — the attachment rule the dial-time allowlist applies.
+// Exported so the ext_proc credential table scopes EgressL4Route-targeted
+// CredentialInjectionPolicies with exactly the same rule.
+func RouteAttachesTo(route clrkv1alpha1.EgressL4Route, egNamespace, egName string) bool {
+	for _, ref := range route.Spec.ParentRefs {
+		if string(ref.Name) != egName {
+			continue
+		}
+		ns := route.Namespace
+		if ref.Namespace != nil {
+			ns = string(*ref.Namespace)
+		}
+		if ns == egNamespace {
+			return true
+		}
+	}
+	return false
+}
+
+// DestinationMatcher answers whether an L7 request's destination — the
+// host:port the forward proxy actually dials — falls under one of an
+// EgressL4Route's rule matches. It reuses routeEntry, so hostname
+// (gwapiv1.Hostname, one-label wildcard), CIDR and port semantics are the
+// ones the dial-time allowlist applies.
+//
+// Unlike compileRouteTable, compilation is strict: a match block with a
+// criterion that can't be honored at L7 (sourceAgents, which the proxy
+// can't evaluate) or that doesn't parse (a bad CIDR, a half-open port
+// range) is dropped instead of silently widening. The matcher gates
+// credential injection, so every doubt resolves to "no match".
+type DestinationMatcher struct {
+	entries []routeEntry
+	// dropped counts match blocks compileStrictMatch rejected.
+	dropped int
+}
+
+// NewDestinationMatcher compiles every rule match of route.
+func NewDestinationMatcher(route clrkv1alpha1.EgressL4Route) *DestinationMatcher {
+	m := &DestinationMatcher{}
+	for _, rule := range route.Spec.Rules {
+		for i := range rule.Matches {
+			if e, ok := compileStrictMatch(&rule.Matches[i]); ok {
+				m.entries = append(m.entries, e)
+			} else {
+				m.dropped++
+			}
+		}
+	}
+	return m
+}
+
+// Counts returns how many of the route's match blocks were compiled and
+// how many were dropped as not honorable at L7. Status reporting uses it
+// to flag a policy whose route can never match.
+func (m *DestinationMatcher) Counts() (usable, dropped int) {
+	return len(m.entries), m.dropped
+}
+
+// MatchAuthority reports whether host:port matches any compiled match
+// block. host is the authority's host part without brackets: a DNS name
+// is matched against destinationHostnames (case-insensitively, DNS names
+// are), an IP literal against destinationCIDRs. HTTP traffic is TCP, so a
+// block restricted to UDP never matches.
+func (m *DestinationMatcher) MatchAuthority(host string, port uint16) bool {
+	if m == nil || host == "" {
+		return false
+	}
+	var (
+		dst     netip.AddrPort
+		dstName string
+	)
+	if addr, err := netip.ParseAddr(host); err == nil {
+		dst = netip.AddrPortFrom(addr.Unmap(), port)
+	} else {
+		// The zero Addr is contained in no prefix, so only hostname
+		// rules can match a DNS name.
+		dst = netip.AddrPortFrom(netip.Addr{}, port)
+		dstName = strings.ToLower(host)
+	}
+	for i := range m.entries {
+		if m.entries[i].matches(dst, clrkv1alpha1.L4ProtocolTCP, dstName) {
+			return true
+		}
+	}
+	return false
+}
+
+// compileStrictMatch compiles one match block for DestinationMatcher,
+// returning ok=false when any criterion can't be honored as written.
+func compileStrictMatch(m *clrkv1alpha1.L4RouteMatch) (routeEntry, bool) {
+	var e routeEntry
+	if m.SourceAgents != nil {
+		return e, false
+	}
+	for _, cidrStr := range m.DestinationCIDRs {
+		prefix, err := netip.ParsePrefix(cidrStr)
+		if err != nil {
+			return e, false
+		}
+		e.cidrs = append(e.cidrs, netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()))
+	}
+	for _, h := range m.DestinationHostnames {
+		e.hostnames = append(e.hostnames, strings.ToLower(string(h)))
+	}
+	for _, pm := range m.Ports {
+		pr, ok := strictPortRange(pm)
+		if !ok {
+			return e, false
+		}
+		e.ports = append(e.ports, pr)
+	}
+	e.protocol = m.Protocol
+	return e, true
+}
+
+// strictPortRange converts a port match, rejecting anything other than
+// exactly one of a valid single port or a valid ordered range.
+func strictPortRange(pm clrkv1alpha1.L4PortMatch) (portRange, bool) {
+	valid := func(p int32) bool { return p >= 1 && p <= 65535 }
+	switch {
+	case pm.Port != nil && pm.StartPort == nil && pm.EndPort == nil:
+		if !valid(*pm.Port) {
+			return portRange{}, false
+		}
+		return portRange{start: uint16(*pm.Port), end: uint16(*pm.Port)}, true
+	case pm.Port == nil && pm.StartPort != nil && pm.EndPort != nil:
+		if !valid(*pm.StartPort) || !valid(*pm.EndPort) || *pm.StartPort > *pm.EndPort {
+			return portRange{}, false
+		}
+		return portRange{start: uint16(*pm.StartPort), end: uint16(*pm.EndPort)}, true
+	}
+	return portRange{}, false
 }
 
 // compileRouteTable builds a routeTable from CRD objects.
