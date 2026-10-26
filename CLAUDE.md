@@ -24,13 +24,13 @@ Develop framework-agnostic agents runtime that solves these problems:
 Two binaries:
 
 - `cmd/controller-manager` — Kubernetes controllers (TaskAgent, WorkerPool, etc.). Runs as a Deployment.
-- `cmd/worker` — Sandbox runtime on each worker pod. Manages container lifecycle via libcontainer, OCI image pulling via ORAS, per-sandbox network namespaces with TAP devices.
+- `cmd/worker` — Sandbox runtime on each worker pod. Runs sandboxes under gVisor (`runsc`) via apoxy's `pkg/sandbox` core, OCI image pulling via ORAS, per-sandbox network namespaces with TAP devices.
 
 Key packages:
 
 - `api/clrk/v1alpha1/` — CRD types (TaskAgent, DaemonAgent, WorkerPool, AgentSandboxRevision, EgressGateway, etc.)
 - `internal/controller/` — controller-runtime reconcilers
-- `internal/worker/` — sandbox lifecycle (linux-only, requires CGO for libcontainer/nsenter)
+- `internal/worker/` — sandbox lifecycle (linux-only). The worker binary must be built with `CGO_ENABLED=0`: runsc re-executes `/proc/self/exe` inside an empty root, where a dynamically linked binary can't find its loader.
 
 ## Build
 
@@ -38,7 +38,7 @@ This repo is built externally and build scripts and tests are not provided as pa
 
 ## Related Repos
 
-- `apoxy-cli` (`github.com/apoxy-dev/apoxy`) — The worker's libcontainer code is ported from `pkg/edgefunc/runc/`. ORAS usage pattern from `pkg/apiserver/ingest/`.
+- `apoxy-cli` (`github.com/apoxy-dev/apoxy`) — The worker's sandbox core is `pkg/sandbox`. ORAS usage pattern from `pkg/apiserver/ingest/`.
 
 ## Code Style
 
